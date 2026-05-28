@@ -1,9 +1,10 @@
+import json
 import re
+from pathlib import Path
 
 #import the libraries
-from tensorflow.keras.datasets import imdb
-from tensorflow.keras.preprocessing import sequence
-from tensorflow.keras.models import load_model
+import h5py
+import numpy as np
 import streamlit as st
 
 MAX_FEATURES = 10000
@@ -11,6 +12,48 @@ MAX_REVIEW_LENGTH = 500
 INDEX_FROM = 3
 OOV_TOKEN = 2
 TOKEN_PATTERN = re.compile(r"[a-z0-9']+")
+BASE_DIR = Path(__file__).resolve().parent
+
+
+class NumpySimpleRNN:
+    def __init__(self, model_path):
+        with h5py.File(model_path, "r") as model_file:
+            self.embeddings = model_file[
+                "model_weights/embedding/sequential/embedding/embeddings"
+            ][()].astype(np.float32)
+            self.rnn_kernel = model_file[
+                "model_weights/simple_rnn/sequential/simple_rnn/simple_rnn_cell/kernel"
+            ][()].astype(np.float32)
+            self.rnn_recurrent_kernel = model_file[
+                "model_weights/simple_rnn/sequential/simple_rnn/simple_rnn_cell/recurrent_kernel"
+            ][()].astype(np.float32)
+            self.rnn_bias = model_file[
+                "model_weights/simple_rnn/sequential/simple_rnn/simple_rnn_cell/bias"
+            ][()].astype(np.float32)
+            self.dense_kernel = model_file[
+                "model_weights/dense/sequential/dense/kernel"
+            ][()].astype(np.float32)
+            self.dense_bias = model_file[
+                "model_weights/dense/sequential/dense/bias"
+            ][()].astype(np.float32)
+
+    def predict_positive_probability(self, padded_review):
+        embedded_review = self.embeddings[padded_review[0]]
+        state = np.zeros(self.rnn_bias.shape, dtype=np.float32)
+
+        for token_embedding in embedded_review:
+            state = np.maximum(
+                token_embedding @ self.rnn_kernel
+                + state @ self.rnn_recurrent_kernel
+                + self.rnn_bias,
+                0,
+            )
+
+        logit = float(state @ self.dense_kernel[:, 0] + self.dense_bias[0])
+        if logit >= 0:
+            return 1.0 / (1.0 + np.exp(-logit))
+        exp_logit = np.exp(logit)
+        return exp_logit / (1.0 + exp_logit)
 
 st.set_page_config(
     page_title="IMDB Sentiment Analysis",
@@ -21,12 +64,13 @@ st.set_page_config(
 
 @st.cache_resource
 def load_sentiment_model():
-    return load_model("SimpleRNN.h5")
+    return NumpySimpleRNN(BASE_DIR / "SimpleRNN.h5")
 
 
 @st.cache_data
 def load_word_index():
-    return imdb.get_word_index()
+    with open(BASE_DIR / "imdb_word_index.json", "r", encoding="utf-8") as word_index_file:
+        return json.load(word_index_file)
 
 
 word_index=load_word_index()
@@ -47,18 +91,16 @@ def preprocess_review(text):
         index += INDEX_FROM
         encoded_review.append(index if index < MAX_FEATURES else OOV_TOKEN)
 
-    padded_review = sequence.pad_sequences(
-        [encoded_review],
-        maxlen=MAX_REVIEW_LENGTH,
-        padding="pre",
-        truncating="pre"
-    )
+    encoded_review = encoded_review[-MAX_REVIEW_LENGTH:]
+    padded_review = np.zeros((1, MAX_REVIEW_LENGTH), dtype=np.int32)
+    if encoded_review:
+        padded_review[0, -len(encoded_review):] = encoded_review
     return padded_review
 
 #predict the sentiment of the review
 def predict_sentiment(review):
     preprocessed_review=preprocess_review(review)
-    positive_probability = float(model.predict(preprocessed_review, verbose=0)[0][0])
+    positive_probability = float(model.predict_positive_probability(preprocessed_review))
     negative_probability = 1 - positive_probability
     sentiment = 'positive' if positive_probability >= 0.5 else 'negative'
     confidence = max(positive_probability, negative_probability)
